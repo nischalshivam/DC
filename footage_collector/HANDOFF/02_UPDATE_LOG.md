@@ -54,3 +54,28 @@ Newest first. These are hard-won fixes; do NOT regress them.
 ### update_ytdlp.bat / update_tools.bat
 8. Install `yt-dlp[default]` and print the version; when stable is broken,
    they point to the nightly: `python -m pip install -U --pre "yt-dlp[default]"`.
+
+## 2026-07 (b) — network resets, section reuse, GUI split
+
+### youtube_clipper.py
+9. **Transient-network retry + ffmpeg reconnect.** Windows surfaces ffmpeg's
+   winsock deaths as "ffmpeg exited with code 4294957242" (= -10054,
+   connection reset by YouTube mid-section-download). `download_section` now
+   (a) passes `--downloader-args ffmpeg_i:-reconnect 1 -reconnect_streamed 1
+   -reconnect_delay_max 5` so ffmpeg survives mid-stream resets, and
+   (b) retries the same client+format once after 2s on any transient error
+   (`_TRANSIENT_ERRORS`/`_is_transient_error`) before moving to the next
+   client. `_err_reason` decodes the huge unsigned codes into plain English.
+10. **"section already used" no longer drops provided links.** Instructor
+   files legitimately reuse one video across several beats. When a provided
+   link's 5s window collides with an earlier scene's, `clip_from_reference`
+   nudges forward (+dur, +2dur, +3dur) to adjacent unused footage; if all
+   nearby windows are taken it accepts the repeat — a curated link always
+   beats the search fallback. Search results (`collect_clip`) still respect
+   the strict no-repeat rule.
+
+### gui.py
+11. **Resizable queue/progress split.** Queue and Progress now live in a
+   vertical `ttk.PanedWindow` — drag the divider to resize. Progress is a
+   monospace (Consolas 10) pane that takes ~4/5 of the extra space; the queue
+   defaults to 4 rows with its own scrollbar. Window default 1100x950.

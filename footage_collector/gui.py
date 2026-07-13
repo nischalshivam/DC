@@ -67,8 +67,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Footage Collector — Batch Queue")
-        root.geometry("920x860")
-        root.minsize(820, 720)
+        root.geometry("1100x950")
+        root.minsize(900, 760)
 
         self.proc = None                       # currently running subprocess
         self.jobs: list[dict] = []             # the queue (list of job dicts)
@@ -124,14 +124,21 @@ class App:
         ttk.Label(jobbtns, text="(tip: queue me row par double-click karke usse edit ke liye load karo)").pack(
             side="left", padx=10)
 
-        # ---------- SECTION 2: the queue ----------
-        qframe = ttk.LabelFrame(outer, text="2)  Queue  (jobs ek-ek karke chalenge)", padding=8)
-        qframe.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        # ---------- resizable split: queue (top) / progress (bottom) ----------
+        # A vertical PanedWindow so the user can DRAG the divider between the
+        # queue and the progress log — the log gets most of the space by
+        # default and grows with the window.
+        self.paned = ttk.PanedWindow(outer, orient="vertical")
+        self.paned.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+
+        # ---------- SECTION 3: the queue ----------
+        qframe = ttk.LabelFrame(self.paned, text="3)  Queue  (jobs ek-ek karke chalenge — border kheench ke chota/bada karo)", padding=8)
+        self.paned.add(qframe, weight=1)
         qframe.columnconfigure(0, weight=1)
         qframe.rowconfigure(0, weight=1)
 
         cols = ("num", "title", "out", "status")
-        self.tree = ttk.Treeview(qframe, columns=cols, show="headings", height=7, selectmode="browse")
+        self.tree = ttk.Treeview(qframe, columns=cols, show="headings", height=4, selectmode="browse")
         self.tree.heading("num", text="#")
         self.tree.heading("title", text="Title")
         self.tree.heading("out", text="Output folder")
@@ -162,9 +169,9 @@ class App:
         self.count_lbl = ttk.Label(qbtns, text="0 job(s)")
         self.count_lbl.pack(side="right", padx=6)
 
-        # ---------- SECTION 3: shared options ----------
-        opt = ttk.LabelFrame(outer, text="3)  Shared options  (poori queue par apply honge)", padding=8)
-        opt.grid(row=2, column=0, sticky="we", pady=(10, 0))
+        # ---------- SECTION 2: shared options ----------
+        opt = ttk.LabelFrame(outer, text="2)  Shared options  (poori queue par apply honge)", padding=8)
+        opt.grid(row=1, column=0, sticky="we", pady=(10, 0))
 
         ttk.Label(opt, text="Clips / scene").grid(row=0, column=0, sticky="w", padx=6)
         self.clips_var = tk.IntVar(value=2)
@@ -199,19 +206,24 @@ class App:
 
         # ---------- SECTION 4: run controls ----------
         run = ttk.Frame(outer)
-        run.grid(row=3, column=0, sticky="we", pady=(10, 0))
+        run.grid(row=2, column=0, sticky="we", pady=(10, 0))
         self.run_btn = ttk.Button(run, text="▶  Start Queue", command=self.start_queue)
         self.run_btn.pack(side="left", padx=4)
         self.stop_btn = ttk.Button(run, text="■ Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=4)
         ttk.Button(run, text="Open output folder", command=self.open_output).pack(side="left", padx=4)
 
-        # ---------- progress log ----------
-        ttk.Label(outer, text="Progress").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        self.log = scrolledtext.ScrolledText(outer, height=14, wrap="word", state="disabled")
-        self.log.grid(row=5, column=0, sticky="nsew", pady=(2, 0))
-        outer.rowconfigure(1, weight=1)
-        outer.rowconfigure(5, weight=2)
+        # ---------- progress log (big, monospace, gets all extra space) ----------
+        logf = ttk.LabelFrame(self.paned, text="Progress", padding=(4, 2))
+        self.paned.add(logf, weight=4)
+        logf.columnconfigure(0, weight=1)
+        logf.rowconfigure(0, weight=1)
+        self.log = scrolledtext.ScrolledText(
+            logf, height=18, wrap="word", state="disabled",
+            font=("Consolas", 10))
+        self.log.grid(row=0, column=0, sticky="nsew")
+        # only the paned area (queue + progress) grows with the window
+        outer.rowconfigure(3, weight=1)
 
         self.root.after(100, self._drain_log)
 

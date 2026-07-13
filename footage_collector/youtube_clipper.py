@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
@@ -120,6 +121,22 @@ _TERMINAL_ERRORS = (
     "not available in your country", "account has been terminated",
     "video has been removed",
 )
+
+# Flaky-network errors worth one immediate same-combo retry. "ffmpeg exited
+# with code 429495..." is yt-dlp's section downloader dying on a Windows
+# connection reset (the huge number is a negative winsock code, e.g.
+# 4294957242 = -10054 WSAECONNRESET) — YouTube drops these mid-transfer
+# routinely and a retry usually succeeds.
+_TRANSIENT_ERRORS = (
+    "connection reset", "connection aborted", "10054", "10053",
+    "timed out", "timeout", "ffmpeg exited with code",
+    "eof occurred", "incomplete read", "temporary failure",
+)
+
+
+def _is_transient_error(reason: str) -> bool:
+    r = reason.lower()
+    return any(t in r for t in _TRANSIENT_ERRORS)
 
 
 def _is_format_error(reason: str) -> bool:
@@ -399,6 +416,16 @@ def _err_reason(proc) -> str:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for ln in reversed(lines):
         if "ERROR" in ln or "error" in ln.lower():
+            # Windows reports ffmpeg's negative winsock exits as huge unsigned
+            # ints (e.g. 4294957242 = -10054 = connection reset). Decode them
+            # so the log says what actually happened.
+            m = re.search(r"ffmpeg exited with code (42949\d{5})", ln)
+            if m:
+                code = int(m.group(1)) - 2 ** 32
+                what = {-10054: "connection reset by YouTube",
+                        -10053: "connection aborted",
+                        -10060: "connection timed out"}.get(code, f"winsock {code}")
+                ln += f"  [= {what}; network hiccup, retried]"
             return ln[:220]
     return (lines[-1][:220] if lines else "unknown error")
 
@@ -468,42 +495,56 @@ def download_section(
         client_args = (["--extractor-args", f"youtube:player_client={client}"]
                        if client else [])
         for fmt in fmt_candidates:
-            for fn in os.listdir(workdir):       # clear any partial leftovers
+            for attempt in (1, 2):
+                for fn in os.listdir(workdir):   # clear any partial leftovers
+                    try:
+                        os.remove(os.path.join(workdir, fn))
+                    except OSError:
+                        pass
+                cmd = _YTDLP + [
+                    url,
+                    "--download-sections", section,
+                    "--force-keyframes-at-cuts",
+                    "-f", fmt,
+                    "--merge-output-format", "mp4",
+                    "--no-warnings",
+                    # ffmpeg streams the section over https and YouTube resets
+                    # those connections routinely; let it reconnect mid-stream
+                    # instead of dying with a winsock error.
+                    "--downloader-args",
+                    "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                    "-o", raw_tmpl,
+                ] + _ffmpeg_location_args() + cookie_args + client_args
                 try:
-                    os.remove(os.path.join(workdir, fn))
-                except OSError:
-                    pass
-            cmd = _YTDLP + [
-                url,
-                "--download-sections", section,
-                "--force-keyframes-at-cuts",
-                "-f", fmt,
-                "--merge-output-format", "mp4",
-                "--no-warnings",
-                "-o", raw_tmpl,
-            ] + _ffmpeg_location_args() + cookie_args + client_args
-            try:
-                proc = _run(cmd, timeout=300)
-            except subprocess.TimeoutExpired:
-                shutil.rmtree(workdir, ignore_errors=True)
-                return False, "yt-dlp timed out"
+                    proc = _run(cmd, timeout=300)
+                except subprocess.TimeoutExpired:
+                    shutil.rmtree(workdir, ignore_errors=True)
+                    return False, "yt-dlp timed out"
 
-            raw = None
-            for fn in os.listdir(workdir):
-                if fn.startswith("raw"):
-                    raw = os.path.join(workdir, fn)
-                    break
-            if raw and os.path.getsize(raw) > 0:
-                got = True
-                break  # got it
-            last_reason = _err_reason(proc)
-            # The video is genuinely gone/restricted — stop trying everything.
-            if _is_terminal_error(last_reason):
-                shutil.rmtree(workdir, ignore_errors=True)
-                return False, last_reason
+                raw = None
+                for fn in os.listdir(workdir):
+                    if fn.startswith("raw"):
+                        raw = os.path.join(workdir, fn)
+                        break
+                if raw and os.path.getsize(raw) > 0:
+                    got = True
+                    break  # got it
+                last_reason = _err_reason(proc)
+                # The video is genuinely gone/restricted — stop everything.
+                if _is_terminal_error(last_reason):
+                    shutil.rmtree(workdir, ignore_errors=True)
+                    return False, last_reason
+                # Flaky network (connection reset etc.): one immediate retry
+                # of the SAME client+format usually succeeds.
+                if attempt == 1 and _is_transient_error(last_reason):
+                    time.sleep(2)
+                    continue
+                break
+            if got:
+                break
             # Only cycle through the other -f strings for format errors. For any
-            # other error (bot-check, extraction fail, etc.) break to the next
-            # CLIENT, which often serves formats the current one refuses.
+            # other error (bot-check, network, extraction fail) break to the
+            # next CLIENT, which often serves formats the current one refuses.
             if not _is_format_error(last_reason):
                 break
         if got:
@@ -776,9 +817,19 @@ def clip_from_reference(
                 start -= PRE_ROLL
             dur = duration
 
+        # Instructor files legitimately revisit the same video for several
+        # beats (e.g. one confession clip covering 5-6 beats). When the exact
+        # section was already used by an earlier scene, nudge forward to the
+        # adjacent unused footage instead of dropping the author's link — and
+        # if everything nearby is taken, accept the repeat: a curated link
+        # beats whatever the search fallback would dredge up.
         bucket = f"{vid}@{int(start // 3)}"
         if used_sections is not None and bucket in used_sections:
-            return None, "section already used"
+            for shift in (dur, 2 * dur, 3 * dur):
+                b2 = f"{vid}@{int((start + shift) // 3)}"
+                if b2 not in used_sections:
+                    start, bucket = start + shift, b2
+                    break
 
         ok, reason = download_section(vid, start, dur, out_path, 720, auth)
         if ok:
