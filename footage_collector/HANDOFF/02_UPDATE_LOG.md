@@ -79,3 +79,36 @@ Newest first. These are hard-won fixes; do NOT regress them.
    vertical `ttk.PanedWindow` — drag the divider to resize. Progress is a
    monospace (Consolas 10) pane that takes ~4/5 of the extra space; the queue
    defaults to 4 rows with its own scrollbar. Window default 1100x950.
+
+## 2026-07 (c) — freeze fix, YouTube rate-limit backoff, last-about anchor
+
+### youtube_clipper.py
+12. **Frozen-run fix (supersedes the reconnect args in item 9a).** The ffmpeg
+   `-reconnect*` downloader-args are REMOVED: they can make ffmpeg reconnect
+   in a loop, and killing yt-dlp on timeout left that orphaned ffmpeg holding
+   our stdout pipe — `subprocess.run` then blocked forever and the whole run
+   looked frozen on one scene with no error. `_run` is now Popen-based and
+   `_kill_tree()` kills the ENTIRE process tree on timeout (Windows:
+   `taskkill /F /T`; POSIX: process-group SIGKILL). `download_section` also
+   has a hard ~270s budget for its whole client×format matrix, plus
+   `--socket-timeout 30 --retries 3`.
+13. **Session-wide rate-limit backoff.** YouTube's "Video unavailable ...
+   session has been rate-limited for up to an hour" kills every request,
+   including good provided links. Detection (`_is_rate_limited`) is checked
+   BEFORE the terminal-error check (the message also contains "Video
+   unavailable"). On detection the run arms a 10-min pause (`_rl_note`) and
+   every network entry point (`download_section`, `search_videos`,
+   `_fetch_subtitles`) waits it out via `_rl_gate()` — max 3 pauses per run,
+   then fail-fast. All yt-dlp calls now carry `--sleep-requests 0.75` to
+   avoid triggering the limiter in the first place.
+
+### instructor_parser.py
+14. **Anchor = LAST "about" clause.** `_ABOUT_RE` now uses a greedy prefix so
+   a literal mid-sentence "about" ("on the phone about the Albanian deal ...
+   — about Rugrats 1991") no longer hijacks half the sentence into the query
+   anchor.
+
+### collector.py
+15. Liveness logs: "[clip] fetching provided link: ..." / "[clip] searching:
+   ..." print BEFORE each network attempt, so a slow download never looks
+   like a frozen run.

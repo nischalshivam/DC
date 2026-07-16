@@ -418,7 +418,12 @@ def _descriptive_keywords(text: str, limit: int = 4) -> List[str]:
     return out[:limit]
 
 
-_ABOUT_RE = re.compile(r"[—–\-,]*\s*\babout\s+([^.]{3,80}?)[\s.]*$", re.I)
+# Greedy leading (.*) locks onto the LAST "about" in the line — Visual text
+# often contains an earlier literal "about" ('...on the phone about the
+# Albanian deal... — about Rugrats 1991 "Runaway Angelica".') and matching the
+# first one used to turn half the sentence into the query anchor.
+_ABOUT_RE = re.compile(
+    r"^(.*)[\s,—–\-(]about\s+([^.]{3,80}?)[\s.\)\"”’]*$", re.I | re.S)
 
 
 def _about_anchor(visual: str):
@@ -431,14 +436,14 @@ def _about_anchor(visual: str):
     its words (like the quoted episode title) from being mistaken for scene
     names, dialogue quotes, or descriptive keywords.
     """
-    m = _ABOUT_RE.search(visual.strip())
+    m = _ABOUT_RE.match(visual.strip())
     if not m:
         return "", visual
-    anchor = re.sub(r"[\"“”‘’]", " ", m.group(1))
+    anchor = re.sub(r"[\"“”‘’()\[\]]", " ", m.group(2))
     anchor = re.sub(r"\s+", " ", anchor).strip(" ,;:-—–")
     if len(anchor.split()) < 2:  # too vague to anchor a search
         return "", visual
-    cleaned = visual[:m.start()].rstrip(" ,;—–-")
+    cleaned = m.group(1).rstrip(" ,;—–-")
     return anchor, (cleaned or visual)
 
 

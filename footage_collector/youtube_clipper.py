@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -65,14 +66,48 @@ class ClipResult:
         return asdict(self)
 
 
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a process AND its children (yt-dlp spawns ffmpeg; killing only
+    yt-dlp leaves ffmpeg alive holding our stdout/stderr pipes open, which
+    blocks the read after a timeout — the tool then looks frozen forever)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _run(cmd: List[str], timeout: int = 180) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True  # own process group -> killable tree
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
+        encoding="utf-8",
+        errors="replace",
+        **kwargs,
     )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:  # drain whatever the dying tree left in the pipes
+            out, err = proc.communicate(timeout=10)
+        except Exception:
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 # --- authentication / anti-bot args ----------------------------------------
@@ -139,6 +174,46 @@ def _is_transient_error(reason: str) -> bool:
     return any(t in r for t in _TRANSIENT_ERRORS)
 
 
+# --- session-wide YouTube rate-limit backoff --------------------------------
+# When YouTube rate-limits, EVERY request from this session fails ("Video
+# unavailable ... The current session has been rate-limited by YouTube for up
+# to an hour"), including perfectly good provided links. Hammering on only
+# extends the ban, so on detection we pause the whole run and resume — that
+# saves the remaining scenes instead of burning them all on dead requests.
+
+_rl_lock_until = 0.0   # while time.time() < this, we're inside a backoff pause
+_rl_waits_left = 3     # long pauses we're willing to sit through per run
+
+
+def _is_rate_limited(reason: str) -> bool:
+    r = (reason or "").lower()
+    return "rate-limited" in r or "rate limited" in r
+
+
+def _rl_note() -> None:
+    """Record that YouTube just rate-limited us; arms a 10-minute pause."""
+    global _rl_lock_until
+    _rl_lock_until = max(_rl_lock_until, time.time() + 600)
+
+
+def _rl_gate() -> bool:
+    """Sit out an active backoff pause before touching YouTube again.
+    Returns False once the pause budget for this run is spent (callers should
+    fail fast instead of stalling forever)."""
+    global _rl_waits_left
+    wait = _rl_lock_until - time.time()
+    if wait <= 0:
+        return True
+    if _rl_waits_left <= 0:
+        return False
+    _rl_waits_left -= 1
+    print(f"    [wait] YouTube rate-limited this session — pausing "
+          f"{int(wait // 60) + 1} min, then resuming automatically "
+          f"(auto-pauses left: {_rl_waits_left})", flush=True)
+    time.sleep(wait)
+    return True
+
+
 def _is_format_error(reason: str) -> bool:
     r = reason.lower()
     return "format is not available" in r or "requested format" in r or "no video formats" in r
@@ -194,17 +269,22 @@ def search_videos(query: str, limit: int = 8, max_minutes: int = 30,
     Return candidate videos [{id, title, duration, title_score}, ...], best
     (most footage-like) first. Uses yt-dlp ytsearch (no API key).
     """
+    if not _rl_gate():
+        return []
     cmd = _YTDLP + [
         f"ytsearch{limit}:{query}",
         "--flat-playlist",
         "--no-warnings",
         "--quiet",
+        "--sleep-requests", "0.75",
         "--print", "%(id)s\t%(title)s\t%(duration)s",
     ] + auth.args()
     try:
         proc = _run(cmd, timeout=90)
     except subprocess.TimeoutExpired:
         return []
+    if _is_rate_limited(proc.stderr or ""):
+        _rl_note()
     results: List[dict] = []
     for line in proc.stdout.strip().splitlines():
         parts = line.split("\t")
@@ -311,6 +391,8 @@ def _phrase_cue_hits(cues: List[tuple], norm_phrases: List[str]) -> set:
 
 def _fetch_subtitles(video_id: str, workdir: str, auth: YtAuth = DEFAULT_AUTH) -> Optional[str]:
     """Download auto/manual English subs (vtt) without the video. Returns path."""
+    if not _rl_gate():
+        return None
     url = f"https://www.youtube.com/watch?v={video_id}"
     out_tmpl = os.path.join(workdir, "%(id)s.%(ext)s")
     cmd = _YTDLP + [
@@ -320,12 +402,15 @@ def _fetch_subtitles(video_id: str, workdir: str, auth: YtAuth = DEFAULT_AUTH) -
         "--sub-langs", "en.*,en",
         "--sub-format", "vtt/srt/best",
         "--no-warnings", "--quiet",
+        "--sleep-requests", "0.75",
         "-o", out_tmpl,
     ] + auth.args()
     try:
-        _run(cmd, timeout=90)
+        proc = _run(cmd, timeout=90)
     except subprocess.TimeoutExpired:
         return None
+    if _is_rate_limited(proc.stderr or ""):
+        _rl_note()
     for fn in os.listdir(workdir):
         if fn.startswith(video_id) and (fn.endswith(".vtt") or fn.endswith(".srt")):
             return os.path.join(workdir, fn)
@@ -424,7 +509,7 @@ def _err_reason(proc) -> str:
                 code = int(m.group(1)) - 2 ** 32
                 what = {-10054: "connection reset by YouTube",
                         -10053: "connection aborted",
-                        -10060: "connection timed out"}.get(code, f"winsock {code}")
+                        -10060: "connection timed out"}.get(code, f"exit {code}")
                 ln += f"  [= {what}; network hiccup, retried]"
             return ln[:220]
     return (lines[-1][:220] if lines else "unknown error")
@@ -460,6 +545,8 @@ def download_section(
 ) -> tuple:
     """Download [start, start+duration] and normalise to 16:9 mp4.
     Returns (ok: bool, reason: str)."""
+    if not _rl_gate():
+        return False, "YouTube rate-limited this session (backoff budget spent)"
     url = f"https://www.youtube.com/watch?v={video_id}"
     end = start + duration
     workdir = tempfile.mkdtemp(prefix="ytclip_")
@@ -491,16 +578,32 @@ def download_section(
     raw = None
     last_reason = "download failed"
     got = False
+    # Hard budget for the WHOLE fallback matrix. Without it, 6 clients x 4
+    # formats x retries of a stubborn video can stall one scene for ages and
+    # the run looks frozen. A healthy 5s section downloads in well under a
+    # minute; if nothing worked after this long, let the caller fall back.
+    deadline = time.time() + 270
     for client in clients:
+        if time.time() >= deadline:
+            break
         client_args = (["--extractor-args", f"youtube:player_client={client}"]
                        if client else [])
         for fmt in fmt_candidates:
+            if time.time() >= deadline:
+                break
             for attempt in (1, 2):
+                remaining = int(deadline - time.time())
+                if remaining <= 10:
+                    break
                 for fn in os.listdir(workdir):   # clear any partial leftovers
                     try:
                         os.remove(os.path.join(workdir, fn))
                     except OSError:
                         pass
+                # NOTE: no ffmpeg "-reconnect" downloader-args here. They sound
+                # helpful but make ffmpeg reconnect in a loop at EOF/resets, and
+                # a looping ffmpeg is what froze whole runs. Transient resets
+                # are handled by the retry below instead.
                 cmd = _YTDLP + [
                     url,
                     "--download-sections", section,
@@ -508,18 +611,20 @@ def download_section(
                     "-f", fmt,
                     "--merge-output-format", "mp4",
                     "--no-warnings",
-                    # ffmpeg streams the section over https and YouTube resets
-                    # those connections routinely; let it reconnect mid-stream
-                    # instead of dying with a winsock error.
-                    "--downloader-args",
-                    "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                    "--socket-timeout", "30",
+                    "--retries", "3",
+                    "--sleep-requests", "0.75",
                     "-o", raw_tmpl,
                 ] + _ffmpeg_location_args() + cookie_args + client_args
                 try:
-                    proc = _run(cmd, timeout=300)
+                    proc = _run(cmd, timeout=min(240, remaining))
                 except subprocess.TimeoutExpired:
-                    shutil.rmtree(workdir, ignore_errors=True)
-                    return False, "yt-dlp timed out"
+                    # tree-killed by _run; treat as a failed attempt, don't
+                    # abort the whole download — another client may be fine
+                    last_reason = "yt-dlp timed out (killed, moving on)"
+                    if attempt == 1:
+                        continue
+                    break
 
                 raw = None
                 for fn in os.listdir(workdir):
@@ -530,6 +635,15 @@ def download_section(
                     got = True
                     break  # got it
                 last_reason = _err_reason(proc)
+                # Rate-limit check MUST come before the terminal check: the
+                # rate-limit message also contains "Video unavailable", but it
+                # is session-wide, not this video's fault. Arm the backoff and
+                # bail — retrying other clients only extends the ban.
+                if _is_rate_limited(last_reason):
+                    _rl_note()
+                    shutil.rmtree(workdir, ignore_errors=True)
+                    return False, ("YouTube rate-limited the session; the run "
+                                   "will pause and resume automatically")
                 # The video is genuinely gone/restricted — stop everything.
                 if _is_terminal_error(last_reason):
                     shutil.rmtree(workdir, ignore_errors=True)

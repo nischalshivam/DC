@@ -417,6 +417,7 @@ def main(argv=None) -> int:
                 break
             out_path = os.path.join(scene_dir, f"clip_{clip_no + 1:02d}.mp4")
             kw = (scene.clip_queries[0].split() if scene.clip_queries else []) + scene.keywords
+            log(f"    [clip] fetching provided link: {ref[:70]} ...")
             try:
                 res, reason = yt.clip_from_reference(
                     ref, kw, out_path, duration=args.clip_duration,
@@ -441,6 +442,7 @@ def main(argv=None) -> int:
                 break
             out_path = os.path.join(scene_dir, f"clip_{ci + 1:02d}.mp4")
             kw = (query.split() + scene.keywords)
+            log(f"    [clip] searching: {query[:70]} ...")
             try:
                 res, reason = yt.collect_clip(
                     query, kw, out_path,
