@@ -214,6 +214,38 @@ def _rl_gate() -> bool:
     return True
 
 
+# --- session-wide "no formats" soft-block detection --------------------------
+# After a rate-limit, YouTube often keeps SEARCH working but withholds every
+# video's formats, so each download dies with "Requested format is not
+# available" — for EVERY video, not just one. Grinding the full client x format
+# matrix per candidate then makes one scene take an hour. Track consecutive
+# all-format-failed videos; once it looks session-wide, shrink the matrix so
+# the run fails fast instead of stalling, and tell the user the real fix.
+
+_fmt_block_streak = 0
+_fmt_block_warned = False
+
+
+def _fmt_blocked() -> bool:
+    # two DIFFERENT videos whose whole client matrix had zero usable formats
+    # is already a session-wide signature, not two coincidences
+    return _fmt_block_streak >= 2
+
+
+def _note_fmt_outcome(all_formats_failed: bool) -> None:
+    global _fmt_block_streak, _fmt_block_warned
+    _fmt_block_streak = (_fmt_block_streak + 1) if all_formats_failed else 0
+    if _fmt_blocked() and not _fmt_block_warned:
+        _fmt_block_warned = True
+        print("    [warn] YouTube is withholding formats for EVERY video "
+              "(session soft-block, usually after a rate-limit).\n"
+              "           Fixes: (1) update yt-dlp to the NIGHTLY build:  "
+              "python -m pip install -U --pre \"yt-dlp[default]\"\n"
+              "           (2) wait ~1 hour before re-running. "
+              "Continuing in fast-fail mode so the run doesn't crawl.",
+              flush=True)
+
+
 def _is_format_error(reason: str) -> bool:
     r = reason.lower()
     return "format is not available" in r or "requested format" in r or "no video formats" in r
@@ -574,6 +606,13 @@ def download_section(
         clients = [None] + _CLIENT_FALLBACKS
     cookie_args = auth.cookie_args()
 
+    # Session-wide format block detected: every video fails every client, so
+    # a full matrix is pure wasted time. Shrink to a quick sanity probe.
+    fast_fail = _fmt_blocked()
+    if fast_fail:
+        clients = clients[:2]
+        fmt_candidates = fmt_candidates[:2]
+
     proc = None
     raw = None
     last_reason = "download failed"
@@ -582,12 +621,16 @@ def download_section(
     # formats x retries of a stubborn video can stall one scene for ages and
     # the run looks frozen. A healthy 5s section downloads in well under a
     # minute; if nothing worked after this long, let the caller fall back.
-    deadline = time.time() + 270
+    deadline = time.time() + (90 if fast_fail else 270)
     for client in clients:
         if time.time() >= deadline:
             break
-        client_args = (["--extractor-args", f"youtube:player_client={client}"]
-                       if client else [])
+        # formats=missing_pot: also accept formats yt-dlp would hide because
+        # they lack a PO token — those are exactly the ones YouTube withholds
+        # right before "Requested format is not available".
+        extractor_val = (f"youtube:player_client={client};formats=missing_pot"
+                         if client else "youtube:formats=missing_pot")
+        client_args = ["--extractor-args", extractor_val]
         for fmt in fmt_candidates:
             if time.time() >= deadline:
                 break
@@ -666,7 +709,10 @@ def download_section(
 
     if not raw or os.path.getsize(raw) == 0:
         shutil.rmtree(workdir, ignore_errors=True)
+        if _is_format_error(last_reason):
+            _note_fmt_outcome(True)   # whole matrix format-failed for this video
         return False, last_reason
+    _note_fmt_outcome(False)          # a download worked -> not session-blocked
 
     # Re-trim to exact duration, normalise to a clean 16:9 1080p mp4.
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -733,6 +779,12 @@ def collect_clip(
     if not candidates:
         return None, "no YouTube search results"
 
+    # Session format-block: downloads are failing for EVERY video right now,
+    # so don't burn a subtitle fetch + full download matrix on 8 candidates —
+    # probe the top few and get out.
+    if _fmt_blocked():
+        candidates = candidates[:3]
+
     last_reason = "download failed"
     workdir = tempfile.mkdtemp(prefix="ytsubs_")
     try:
@@ -751,6 +803,7 @@ def collect_clip(
 
         scored.sort(key=lambda x: (x[0], -(x[3] or 1e9)), reverse=True)
 
+        fmt_fails = 0
         for combined, kscore, cand, vdur, m_start, matched in scored:
             vid = cand["id"]
             if m_start is not None and kscore > 0:
@@ -766,7 +819,15 @@ def collect_clip(
             if bucket in used_sections:
                 continue
 
+            print(f"      [try] {cand['title'][:52]} ...", flush=True)
             ok, reason = download_section(vid, start, duration, out_path, max_height, auth)
+            if not ok and _is_format_error(reason or ""):
+                # Two different videos with zero usable formats = the block is
+                # session-wide; the remaining candidates will fail identically.
+                fmt_fails += 1
+                if fmt_fails >= 2:
+                    return None, (reason or "no formats") + \
+                        "  [session-wide; skipping remaining candidates]"
             if ok:
                 used_sections.add(bucket)
                 return ClipResult(

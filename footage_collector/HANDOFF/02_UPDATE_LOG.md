@@ -112,3 +112,23 @@ Newest first. These are hard-won fixes; do NOT regress them.
 15. Liveness logs: "[clip] fetching provided link: ..." / "[clip] searching:
    ..." print BEFORE each network attempt, so a slow download never looks
    like a frozen run.
+
+## 2026-07 (d) — post-rate-limit "no formats" soft-block: fast-fail + missing_pot
+
+### youtube_clipper.py
+16. **`formats=missing_pot` on every download attempt.** After a rate-limit,
+   YouTube often keeps search working but withholds formats that lack a PO
+   token, so every video dies with "Requested format is not available". The
+   extractor-args now include `formats=missing_pot` (with and without a
+   player_client), letting yt-dlp use those withheld formats when possible.
+17. **Session-wide format-block detection.** `_note_fmt_outcome` tracks
+   consecutive videos whose ENTIRE client matrix format-failed; at 2 the
+   session is considered soft-blocked (`_fmt_blocked`): a one-time [warn] is
+   printed with the real fixes (yt-dlp nightly / wait ~1h), download_section
+   shrinks to 2 clients x 2 formats with a 90s budget, and collect_clip
+   probes only the top 3 candidates and aborts a query after 2 format-failed
+   candidates. A blocked scene now costs seconds instead of an hour — this
+   was the "20 min stuck on scene 1" report. Any successful download resets
+   the streak to 0.
+18. **Per-candidate liveness**: collect_clip prints "[try] <title> ..." before
+   each candidate download.
