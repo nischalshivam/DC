@@ -182,7 +182,8 @@ def _is_transient_error(reason: str) -> bool:
 # saves the remaining scenes instead of burning them all on dead requests.
 
 _rl_lock_until = 0.0   # while time.time() < this, we're inside a backoff pause
-_rl_waits_left = 3     # long pauses we're willing to sit through per run
+_rl_waits_left = 6     # long pauses we're willing to sit through per run
+_rl_hits = 0           # how many times this run got rate-limited
 
 
 def _is_rate_limited(reason: str) -> bool:
@@ -190,10 +191,20 @@ def _is_rate_limited(reason: str) -> bool:
     return "rate-limited" in r or "rate limited" in r
 
 
+def _sleep_req_args() -> List[str]:
+    """Request throttle for every yt-dlp call. After the first rate-limit of
+    the run, slow down further — finishing slower beats losing 15 scenes."""
+    return ["--sleep-requests", "1.5" if _rl_hits else "0.75"]
+
+
 def _rl_note() -> None:
-    """Record that YouTube just rate-limited us; arms a 10-minute pause."""
-    global _rl_lock_until
-    _rl_lock_until = max(_rl_lock_until, time.time() + 600)
+    """Record that YouTube just rate-limited us. Pauses grow with each hit
+    (10 -> 15 -> 20 min ...): if the last pause wasn't enough, a longer one
+    is more likely to outlive the block."""
+    global _rl_lock_until, _rl_hits
+    _rl_hits += 1
+    pause = min(600 + 300 * (_rl_hits - 1), 1500)
+    _rl_lock_until = max(_rl_lock_until, time.time() + pause)
 
 
 def _rl_gate() -> bool:
@@ -308,9 +319,8 @@ def search_videos(query: str, limit: int = 8, max_minutes: int = 30,
         "--flat-playlist",
         "--no-warnings",
         "--quiet",
-        "--sleep-requests", "0.75",
         "--print", "%(id)s\t%(title)s\t%(duration)s",
-    ] + auth.args()
+    ] + _sleep_req_args() + auth.args()
     try:
         proc = _run(cmd, timeout=90)
     except subprocess.TimeoutExpired:
@@ -434,9 +444,8 @@ def _fetch_subtitles(video_id: str, workdir: str, auth: YtAuth = DEFAULT_AUTH) -
         "--sub-langs", "en.*,en",
         "--sub-format", "vtt/srt/best",
         "--no-warnings", "--quiet",
-        "--sleep-requests", "0.75",
         "-o", out_tmpl,
-    ] + auth.args()
+    ] + _sleep_req_args() + auth.args()
     try:
         proc = _run(cmd, timeout=90)
     except subprocess.TimeoutExpired:
@@ -656,9 +665,8 @@ def download_section(
                     "--no-warnings",
                     "--socket-timeout", "30",
                     "--retries", "3",
-                    "--sleep-requests", "0.75",
                     "-o", raw_tmpl,
-                ] + _ffmpeg_location_args() + cookie_args + client_args
+                ] + _sleep_req_args() + _ffmpeg_location_args() + cookie_args + client_args
                 try:
                     proc = _run(cmd, timeout=min(240, remaining))
                 except subprocess.TimeoutExpired:
@@ -819,7 +827,10 @@ def collect_clip(
             if bucket in used_sections:
                 continue
 
-            print(f"      [try] {cand['title'][:52]} ...", flush=True)
+            # ascii-safe: exotic characters in video titles crash print() on
+            # Windows' cp1252 console (seen as UnicodeEncodeError in the log)
+            safe_title = cand["title"][:52].encode("ascii", "replace").decode()
+            print(f"      [try] {safe_title} ...", flush=True)
             ok, reason = download_section(vid, start, duration, out_path, max_height, auth)
             if not ok and _is_format_error(reason or ""):
                 # Two different videos with zero usable formats = the block is

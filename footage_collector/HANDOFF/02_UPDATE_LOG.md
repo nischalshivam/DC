@@ -132,3 +132,42 @@ Newest first. These are hard-won fixes; do NOT regress them.
    the streak to 0.
 18. **Per-candidate liveness**: collect_clip prints "[try] <title> ..." before
    each candidate download.
+
+## 2026-07 (e) — resume/skip system, start-from-scene UI, more rate-limit stamina
+
+### collector.py
+19. **Resume by default.** Before processing a scene, if its folder already
+   holds >= clips_per_scene non-empty `clip_*.mp4` files (from an earlier
+   run), the scene is skipped with a log line. Re-running the SAME job with
+   the SAME output folder therefore only works on scenes that are still
+   missing clips — this is the recovery path for laptop-shutdown / net-drop /
+   rate-limited-tail runs. `--no-resume` forces a full redo. When clips
+   failed, the DONE summary now tells the user to re-run the same job after
+   ~1h.
+
+### youtube_clipper.py
+20. **More rate-limit stamina.** 6 auto-pauses per run (was 3), pause length
+   grows 10 -> 15 -> 20 -> 25 min (capped), and after the FIRST rate-limit of
+   a run every yt-dlp call switches from `--sleep-requests 0.75` to `1.5`
+   (`_sleep_req_args`). Rationale: a 48-scene run burned all 3 short pauses
+   by scene 17 and lost 15 scenes.
+21. **ascii-safe candidate prints.** Video titles with exotic characters
+   crashed `print()` on Windows cp1252 (UnicodeEncodeError in scene 32 of the
+   Candace run); the [try] line now ascii-replaces.
+
+### instructor_parser.py
+22. **Anchor junk-dash cleanup.** When the Visual line has a mid-sentence
+   "about" and no real "about <Title Year>" clause ("singing about feeling
+   the universe against her — Candace Against the Universe 2020"), keep only
+   the part after the last dash and reject anchors > 8 words (falls back to
+   the global subject).
+
+### gui.py
+23. **Start-from-scene + scene auto-detect.** Picking an instructor file
+   parses it immediately (`detect_scene_count`, same parser as the collector)
+   and shows "total scenes in this file: N"; a "Start from scene" spinbox
+   (per job, default 1) passes `--start-scene N`. A shared "Resume" checkbox
+   (default ON) controls `--no-resume`.
+24. **UTF-8 child process.** collector.py now runs with PYTHONIOENCODING=
+   utf-8 / PYTHONUTF8=1 and the GUI reads its output as UTF-8 with
+   errors=replace — kills the whole UnicodeEncodeError class.

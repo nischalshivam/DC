@@ -220,6 +220,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Limit number of scenes processed (0 = all)")
     p.add_argument("--start-scene", type=int, default=1,
                    help="1-based scene index to start from (for resuming)")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Redo scenes even if their folder already has clips "
+                        "(default: scenes with enough clips are skipped)")
 
     p.add_argument("--cookies", default=None, help="Path to a cookies.txt for YouTube")
     p.add_argument("--cookies-from-browser", default=None,
@@ -374,6 +377,21 @@ def main(argv=None) -> int:
     for n, scene in enumerate(specs, 1):
         scene_dir = os.path.join(args.out, scene.slug())
         os.makedirs(scene_dir, exist_ok=True)
+
+        # RESUME: if this scene's folder already has clips from an earlier run
+        # (laptop shut down, net dropped, rate-limit killed the tail of a run),
+        # don't redo it — so re-running the SAME job with the SAME output
+        # folder only works on the scenes that are still missing clips.
+        if not args.no_resume:
+            have = [f for f in os.listdir(scene_dir)
+                    if f.startswith("clip_") and f.endswith(".mp4")
+                    and os.path.getsize(os.path.join(scene_dir, f)) > 0]
+            if len(have) >= max(1, args.clips_per_scene):
+                log(f"\n--- Scene {scene.index}/{last_idx}  ({n}/{len(specs)}) --- "
+                    f"already has {len(have)} clip(s) -> skipped (resume). "
+                    f"Use --no-resume to redo.")
+                continue
+
         log(f"\n--- Scene {scene.index}/{last_idx}  ({n}/{len(specs)}) ---")
         if scene.summary:
             log(f"    about : {scene.summary}")
@@ -525,6 +543,12 @@ def main(argv=None) -> int:
     log(f"  clips: {totals['clips']} ok, {totals['clip_fail']} failed | "
         f"images: {totals['images']} (incl. {totals['frames']} frames from clips)")
     log(f"  manifest: {manifest_path}")
+    if totals["clip_fail"] > 0:
+        log("-" * 66)
+        log(f"  {totals['clip_fail']} clip(s) failed (usually YouTube rate-limiting")
+        log("  the tail of a long run). FIX: run this SAME job again with the")
+        log("  SAME output folder after ~1 hour — completed scenes are skipped")
+        log("  automatically (resume) and only the missing clips are retried.")
     log("=" * 66)
     return 0
 

@@ -441,7 +441,14 @@ def _about_anchor(visual: str):
         return "", visual
     anchor = re.sub(r"[\"“”‘’()\[\]]", " ", m.group(2))
     anchor = re.sub(r"\s+", " ", anchor).strip(" ,;:-—–")
-    if len(anchor.split()) < 2:  # too vague to anchor a search
+    # A dash inside the candidate usually means a mid-sentence "about" leaked
+    # sentence text before the real title ("feeling the universe against her —
+    # Candace Against the Universe 2020") — keep only the part after the last
+    # dash, which is the actual anchor.
+    if "—" in anchor or "–" in anchor:
+        anchor = re.split(r"[—–]", anchor)[-1].strip(" ,;:-")
+    words = anchor.split()
+    if len(words) < 2 or len(words) > 8:  # too vague / clearly sentence junk
         return "", visual
     cleaned = m.group(1).rstrip(" ,;—–-")
     return anchor, (cleaned or visual)

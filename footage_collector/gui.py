@@ -56,11 +56,31 @@ def build_cmd(job: dict, opts: dict) -> list:
         cmd += ["--context", job["context"].strip()]
     if job.get("title", "").strip():
         cmd += ["--title", job["title"].strip()]
+    try:
+        start_scene = int(job.get("start_scene", 1) or 1)
+    except (TypeError, ValueError):
+        start_scene = 1
+    if start_scene > 1:
+        cmd += ["--start-scene", str(start_scene)]
+    if not opts.get("resume", True):
+        cmd += ["--no-resume"]
     if opts.get("cookies_file", "").strip():
         cmd += ["--cookies", opts["cookies_file"].strip()]
     elif opts.get("cookies_browser", "none") != "none":
         cmd += ["--cookies-from-browser", opts["cookies_browser"]]
     return cmd
+
+
+def detect_scene_count(instructor_path: str):
+    """How many scenes the tool will create for this instructor file.
+    Returns int or None. Uses the same parser as collector.py, so the number
+    always matches the real run."""
+    try:
+        import instructor_parser as ip
+        with open(instructor_path, "r", encoding="utf-8", errors="ignore") as f:
+            return len(ip.parse_beats(f.read()))
+    except Exception:
+        return None
 
 
 class App:
@@ -102,6 +122,19 @@ class App:
         self.instructor_var = tk.StringVar()
         ttk.Entry(form, textvariable=self.instructor_var).grid(row=r, column=1, sticky="we", **pad)
         ttk.Button(form, text="Browse…", command=lambda: self._pick(self.instructor_var)).grid(row=r, column=2, **pad)
+
+        # scene auto-detect + start-from-scene (resume a killed/partial run)
+        r += 1
+        ttk.Label(form, text="Start from scene").grid(row=r, column=0, sticky="w", **pad)
+        srow = ttk.Frame(form)
+        srow.grid(row=r, column=1, columnspan=2, sticky="w", **pad)
+        self.start_scene_var = tk.IntVar(value=1)
+        self.start_scene_spin = ttk.Spinbox(srow, from_=1, to=999, width=6,
+                                            textvariable=self.start_scene_var)
+        self.start_scene_spin.pack(side="left")
+        self.scenes_lbl = ttk.Label(srow, text="(instructor file chuno — total scenes yahan dikhenge)")
+        self.scenes_lbl.pack(side="left", padx=10)
+        self.instructor_var.trace_add("write", self._update_scene_count)
 
         r += 1
         ttk.Label(form, text="Clean script (optional)").grid(row=r, column=0, sticky="w", **pad)
@@ -204,6 +237,13 @@ class App:
         ttk.Combobox(opt, textvariable=self.sources_var, width=20, state="readonly",
                      values=IMAGE_SOURCE_CHOICES).grid(row=3, column=6, columnspan=2, padx=6, sticky="w")
 
+        self.resume_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opt, variable=self.resume_var,
+            text="Resume: jin scenes ke clips pehle se output folder me hain unhe skip karo "
+                 "(failed/adhura run dobara chalane par sirf bache hue scenes hote hain)"
+        ).grid(row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(6, 0))
+
         # ---------- SECTION 4: run controls ----------
         run = ttk.Frame(outer)
         run.grid(row=2, column=0, sticky="we", pady=(10, 0))
@@ -228,13 +268,28 @@ class App:
         self.root.after(100, self._drain_log)
 
     # ---------------- form <-> job helpers ----------------
+    def _update_scene_count(self, *_args):
+        path = self.instructor_var.get().strip()
+        if path and os.path.isfile(path):
+            n = detect_scene_count(path)
+            if n:
+                self.scenes_lbl.configure(text=f"total scenes in this file: {n}")
+                self.start_scene_spin.configure(to=max(n, 1))
+                return
+        self.scenes_lbl.configure(text="(instructor file chuno — total scenes yahan dikhenge)")
+
     def _form_to_job(self) -> dict:
+        try:
+            start_scene = max(1, int(self.start_scene_var.get()))
+        except Exception:
+            start_scene = 1
         return {
             "title": self.title_var.get().strip(),
             "context": self.context_var.get().strip(),
             "instructor": self.instructor_var.get().strip(),
             "script": self.script_var.get().strip(),
             "out": self.out_var.get().strip(),
+            "start_scene": start_scene,
             "status": "Pending",
         }
 
@@ -244,6 +299,7 @@ class App:
         self.instructor_var.set(job.get("instructor", ""))
         self.script_var.set(job.get("script", ""))
         self.out_var.set(job.get("out", ""))
+        self.start_scene_var.set(job.get("start_scene", 1))
 
     def _valid_job(self, job: dict) -> bool:
         if not job["instructor"] or not os.path.isfile(job["instructor"]):
@@ -255,6 +311,7 @@ class App:
         for v in (self.title_var, self.context_var, self.instructor_var, self.script_var):
             v.set("")
         self.out_var.set(os.path.join(HERE, "output"))
+        self.start_scene_var.set(1)
 
     def add_job(self):
         job = self._form_to_job()
@@ -388,6 +445,7 @@ class App:
             "sources": self.sources_var.get(),
             "cookies_file": self.cookies_file_var.get(),
             "cookies_browser": self.cookies_var.get(),
+            "resume": self.resume_var.get(),
         }
 
     def start_queue(self):
@@ -427,9 +485,13 @@ class App:
             self.log_q.put("$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n\n")
             rc = None
             try:
+                # force UTF-8 both ways: exotic characters in video titles used
+                # to crash collector prints on Windows' cp1252 console
+                env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
                 self.proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, cwd=HERE)
+                    text=True, encoding="utf-8", errors="replace",
+                    bufsize=1, cwd=HERE, env=env)
                 for line in self.proc.stdout:
                     self.log_q.put(line)
                 rc = self.proc.wait()
