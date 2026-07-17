@@ -171,3 +171,17 @@ Newest first. These are hard-won fixes; do NOT regress them.
 24. **UTF-8 child process.** collector.py now runs with PYTHONIOENCODING=
    utf-8 / PYTHONUTF8=1 and the GUI reads its output as UTF-8 with
    errors=replace — kills the whole UnicodeEncodeError class.
+
+## 2026-07 (f) — out-of-range provided timestamps (ffmpeg exit -34)
+
+### youtube_clipper.py
+25. **Clamp provided timestamps to the real video length.** LLM-written Clip
+   Links regularly carry a "?t=" past the video's end (real link, invented
+   timestamp) — the requested section came back empty and ffmpeg exited with
+   -34 (shown as 4294967262), which the log mislabeled a "network hiccup".
+   `clip_from_reference` now estimates length from the last subtitle cue (or
+   one cached `_video_duration` metadata call when there are no subs) and,
+   when start+dur exceeds it, pulls the window back to the video's tail with
+   a `[fix] t=Xs is past the video's end (~Ys) -> using t=Zs` log line.
+   `_err_reason` decodes -34 correctly and `_is_transient_error` no longer
+   retries it (it can never succeed).

@@ -171,6 +171,10 @@ _TRANSIENT_ERRORS = (
 
 def _is_transient_error(reason: str) -> bool:
     r = reason.lower()
+    # ffmpeg exit -34 = empty/out-of-range section (timestamp past the video's
+    # end). That is NOT a network problem — retrying can never fix it.
+    if "out-of-range section" in r:
+        return False
     return any(t in r for t in _TRANSIENT_ERRORS)
 
 
@@ -431,6 +435,36 @@ def _phrase_cue_hits(cues: List[tuple], norm_phrases: List[str]) -> set:
     return hits
 
 
+_DUR_CACHE: dict = {}
+
+
+def _video_duration(video_id: str, auth: YtAuth = DEFAULT_AUTH) -> Optional[float]:
+    """Video length in seconds via one cheap metadata call (cached per id).
+    Used to catch LLM-provided timestamps that point past the video's end."""
+    if video_id in _DUR_CACHE:
+        return _DUR_CACHE[video_id]
+    if not _rl_gate():
+        return None
+    cmd = _YTDLP + [
+        f"https://www.youtube.com/watch?v={video_id}",
+        "--skip-download", "--no-warnings", "--quiet",
+        "--print", "%(duration)s",
+    ] + _sleep_req_args() + auth.args()
+    dur = None
+    try:
+        proc = _run(cmd, timeout=60)
+        if _is_rate_limited(proc.stderr or ""):
+            _rl_note()
+        lines = (proc.stdout or "").strip().splitlines()
+        if lines:
+            dur = float(lines[-1])
+    except Exception:
+        dur = None
+    if dur:
+        _DUR_CACHE[video_id] = dur
+    return dur
+
+
 def _fetch_subtitles(video_id: str, workdir: str, auth: YtAuth = DEFAULT_AUTH) -> Optional[str]:
     """Download auto/manual English subs (vtt) without the video. Returns path."""
     if not _rl_gate():
@@ -548,10 +582,13 @@ def _err_reason(proc) -> str:
             m = re.search(r"ffmpeg exited with code (42949\d{5})", ln)
             if m:
                 code = int(m.group(1)) - 2 ** 32
-                what = {-10054: "connection reset by YouTube",
-                        -10053: "connection aborted",
-                        -10060: "connection timed out"}.get(code, f"exit {code}")
-                ln += f"  [= {what}; network hiccup, retried]"
+                what = {-10054: "connection reset by YouTube; retried",
+                        -10053: "connection aborted; retried",
+                        -10060: "connection timed out; retried",
+                        -34: "empty/out-of-range section — the timestamp is "
+                             "likely past the video's end"}.get(
+                    code, f"exit {code}")
+                ln += f"  [= {what}]"
             return ln[:220]
     return (lines[-1][:220] if lines else "unknown error")
 
@@ -952,6 +989,7 @@ def clip_from_reference(
     workdir = tempfile.mkdtemp(prefix="ytref_")
     try:
         kwmatch, best_start, matched = 0, None, ""
+        cues: List[tuple] = []
         sub = _fetch_subtitles(vid, workdir, auth)
         if sub:
             cues = _parse_vtt(sub)
@@ -1002,6 +1040,20 @@ def clip_from_reference(
             if start > PRE_ROLL:
                 start -= PRE_ROLL
             dur = duration
+
+        # Clamp to the REAL video length. LLM-written links regularly carry a
+        # timestamp past the video's end (the link is real, the "?t=" is
+        # invented) — the section came back empty and ffmpeg died with exit
+        # -34. The last subtitle cue's end is a free length estimate; without
+        # subs, one cached metadata call fetches the true duration.
+        vdur = cues[-1][1] if cues else None
+        if vdur is None:
+            vdur = _video_duration(vid, auth)
+        if vdur and start + dur > vdur:
+            old = start
+            start = max(0.0, vdur - dur - 1.0)
+            print(f"      [fix] t={old:.0f}s is past the video's end "
+                  f"(~{vdur:.0f}s) -> using t={start:.0f}s", flush=True)
 
         # Instructor files legitimately revisit the same video for several
         # beats (e.g. one confession clip covering 5-6 beats). When the exact
