@@ -18,6 +18,7 @@ Tkinter ships with Python, so no extra install is needed for the window itself.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import subprocess
@@ -28,6 +29,36 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+QUEUE_FILE = os.path.join(HERE, "queue.json")
+
+
+def save_queue_file(jobs: list, path: str = QUEUE_FILE) -> None:
+    """Persist the queue so closing the app / shutting the laptop doesn't
+    lose it. Best-effort: a failed save never breaks the UI."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(jobs, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def load_queue_file(path: str = QUEUE_FILE) -> list:
+    """Load a previously saved queue. Jobs that were mid-run when the app
+    died come back as Pending so Start Queue picks them up again (the
+    collector's per-scene resume skips whatever they already finished)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            jobs = json.load(f)
+        out = []
+        for j in jobs:
+            if isinstance(j, dict) and j.get("instructor"):
+                if j.get("status") in ("Running", "Stopped", "Failed"):
+                    j["status"] = "Pending"
+                j.setdefault("status", "Pending")
+                out.append(j)
+        return out
+    except Exception:
+        return []
 
 IMAGE_SOURCE_CHOICES = [
     "ddg,wikimedia", "ddg,wikimedia,openverse", "ddg", "wikimedia",
@@ -265,6 +296,15 @@ class App:
         # only the paned area (queue + progress) grows with the window
         outer.rowconfigure(3, weight=1)
 
+        # restore the queue from the last session (jobs survive app close /
+        # laptop shutdown; mid-run jobs come back as Pending)
+        restored = load_queue_file()
+        if restored:
+            self.jobs = restored
+            self._refresh_tree()
+            self._append(f"[queue] {len(restored)} saved job(s) restored from last session. "
+                         "Start Queue dabate hi ye wahin se continue karenge (done scenes skip).\n")
+
         self.root.after(100, self._drain_log)
 
     # ---------------- form <-> job helpers ----------------
@@ -387,6 +427,7 @@ class App:
                 tags=(st,))
             self.row_ids.append(iid)
         self.count_lbl.configure(text=f"{len(self.jobs)} job(s)")
+        save_queue_file(self.jobs)
 
     def _set_status(self, idx: int, status: str):
         """Thread-safe: schedule a status update on the Tk main thread."""
@@ -398,6 +439,7 @@ class App:
                     vals = list(self.tree.item(iid, "values"))
                     vals[3] = status
                     self.tree.item(iid, values=vals, tags=(status,))
+                save_queue_file(self.jobs)
         self.root.after(0, _apply)
 
     # ---------------- file pickers / log ----------------

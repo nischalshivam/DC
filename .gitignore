@@ -8,3 +8,6 @@ __pycache__/
 
 # secrets — cookies give access to your YouTube account
 *cookies*.txt
+
+# user-local queue state
+footage_collector/queue.json

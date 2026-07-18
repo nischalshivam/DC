@@ -185,3 +185,14 @@ Newest first. These are hard-won fixes; do NOT regress them.
    a `[fix] t=Xs is past the video's end (~Ys) -> using t=Zs` log line.
    `_err_reason` decodes -34 correctly and `_is_transient_error` no longer
    retries it (it can never succeed).
+
+## 2026-07 (g) — persistent queue
+
+### gui.py
+26. **Queue survives app close.** The job list is saved to
+   `footage_collector/queue.json` on every change (add/edit/remove/reorder/
+   status) and restored on startup; jobs that were Running/Stopped/Failed
+   when the app died come back as Pending. Combined with the collector's
+   per-scene resume, reopening the app and pressing Start Queue continues a
+   killed batch exactly where it left off (finished scenes skip in seconds).
+   `queue.json` is gitignored (user-local state).
